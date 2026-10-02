@@ -60,6 +60,7 @@
 % subID, sesID 
 % paths NeurOne session files
 % trial csv per block (specifically evaluation might be off if stopped and started recording)
+% CANCEL CHANLOC POP-UPS
 
 
 clear; clc;
@@ -68,39 +69,39 @@ eeglab nogui;
 
 
 %% 1. Subject / session identifiers and output root
-subID = 'Pilot002';
+subID = 'Pilot003';
 sesID = 'prime';
 
 bids_root = 'D:\Linus\Loop\BIDS';
 
 %% 2. NeurOne session files, and which phase/task/run each block is
 % SINGLE QUOTES 'path'
-path_1 = 'D:\Linus\Loop\Import\Loop_Pilot002\Loop_Pilot002\NeurOne-2026-08-06T112547.ses';
-path_2 = 'D:\Linus\Loop\Import\Loop_Pilot002\Loop_Pilot002\NeurOne-2026-08-06T122258.ses';
+path_1 = 'E:\Loop_Pilot003\NeurOne-2026-09-02T151131.ses';
+path_2 = 'E:\Loop_Pilot004\NeurOne-2026-09-04T133715.ses';
 path_3 = 'D:\Linus\Loop\Import\Loop_Pilot002\Loop_Pilot002\NeurOne-2026-08-06T134706.ses';
 path_4 = 'D:\Linus\Loop\Import\Loop_Pilot002\Loop_Pilot002\NeurOne-2026-08-06T141352.ses';
 
 % columns: SubID, SesID, .ses path, NeurOne phase number, task, run
 recordings = {
-    subID, sesID, path_1, 1, 'baseline',          '01';
-    subID, sesID, path_2, 1, 'intervention-all',  '01';
-    subID, sesID, path_2, 2, 'evaluation-t0',     '01';
-    subID, sesID, path_2, 3, 'evaluation-t15',    '01';
-    subID, sesID, path_3, 1, 'evaluation-t30',    '01';
-    subID, sesID, path_4, 2, 'evaluation-t60',    '01';  
+    subID, sesID, path_1, 2, 'baseline',          '01';
+    subID, sesID, path_1, 4, 'intervention-all',  '01';
+    subID, sesID, path_1, 5, 'evaluation-t0',     '01';
+    subID, sesID, path_1, 6, 'evaluation-t15',    '01';
+    subID, sesID, path_1, 7, 'evaluation-t30',    '01';
+    subID, sesID, path_1, 8, 'evaluation-t60',    '01';  
 };
 
 
 %% 3. Trigger / PRIME-performance CSVs, one per task
-trigger_csv_root = fullfile('D:\Linus\Loop\Import\Loop_Pilot002\102\prime');
+trigger_csv_root = fullfile('D:\Linus\Loop\BIDS\sub-pilot004\ses-prime\104\prime');
 
 trigger_csv_map = containers.Map();
 trigger_csv_map('baseline')         = fullfile(trigger_csv_root, 'trials_baseline.csv');
 trigger_csv_map('intervention-all') = fullfile(trigger_csv_root, 'trials_intervention.csv');
 trigger_csv_map('evaluation-t0')    = fullfile(trigger_csv_root, 'trials_evaluation_1.csv');
 trigger_csv_map('evaluation-t15')   = fullfile(trigger_csv_root, 'trials_evaluation_2.csv');
-trigger_csv_map('evaluation-t30')   = fullfile(trigger_csv_root, 'trials_evaluation_4.csv');
-trigger_csv_map('evaluation-t60')   = fullfile(trigger_csv_root, 'trials_evaluation_5.csv'); 
+trigger_csv_map('evaluation-t30')   = fullfile(trigger_csv_root, 'trials_evaluation_3.csv');
+trigger_csv_map('evaluation-t60')   = fullfile(trigger_csv_root, 'trials_evaluation_4.csv'); 
 
 
 %% 4. EMG channel identification

@@ -152,7 +152,7 @@ end
 
 % ---- subject / session -----------------------------------------------------------------
 bids_root = 'D:\Linus\Loop\BIDS';
-subject   = 'Pilot002';
+subject   = 'Pilot003';
 session   = 'prime';
 run       = '01';
 
@@ -227,7 +227,7 @@ PRED_WITHIN_BLOCK = true;                % quartiles within each intervention bl
                                          % "whichever block ran higher predictions"
 
 % ---- region of interest and plotting ---------------------------------------------------
-ROI       = {'C3', 'FC3', 'CP3', 'C1', 'C5'};
+ROI       = {'C3', 'FC3', 'CP3', 'C1', 'FC1', 'Cz'};
 ROI_NAME  = 'M1l';
 PLOT_XLIM = [-100, 200];                 % ms
 TOPO_WIN  = [40, 50];                    % ms, the N45 the intervention targets
@@ -307,8 +307,10 @@ for iT = 1:numel(TASKS)
     T = T(~ismember(T.condition, EXCLUDE_COND), :);
     T.row_in_task = (1:height(T))';
     events(task) = T;
-
+    
     [labs, counts] = countlabels(T.block_label);
+    labs = string(labs);
+    labs(ismissing(labs)) = "NA";
     fprintf('task-%-16s %4d single pulses  [%s]\n', task, height(T), ...
         strjoin(arrayfun(@(k) sprintf('%s:%d', labs(k), counts(k)), 1:numel(labs), ...
         'UniformOutput', false), ', '));
@@ -476,6 +478,26 @@ for iB = 1:numel(blocks)
             thr = repmat(pquantile(v, q), size(v));
         end
         if strcmp(side, 'high'), sel = v >= thr; else, sel = v <= thr; end
+
+        % A quartile split is only a contrast if it actually splits. When the column is
+        % near-constant, the 25th and 75th percentiles collapse onto the same value, the
+        % >= and <= tests both let almost everything through, and "top quartile vs bottom
+        % quartile" silently becomes the same trials compared against themselves -- with a
+        % difference near zero and a tight CI that looks like a clean null. Say so loudly
+        % instead. (TEP_sensorspace.ipynb has the same behaviour and the same blind spot.)
+        n_valid  = numel(v);
+        frac_sel = sum(sel) / max(1, n_valid);
+        frac_tie = sum(v == thr) / max(1, n_valid);
+        if frac_sel > min(0.5, PRED_Q * 1.75)
+            warning('AARATEP:degenerateSplit', ...
+                ['%s: the %s %s split kept %d of %d valid trials (%.0f%%), not the ~%.0f%% ' ...
+                 'a quartile should. %.0f%% of the values sit exactly on the threshold ' ...
+                 '(%.4g), so the two halves overlap and this contrast is not ' ...
+                 'interpretable. Check the %s column in the trials CSV.'], ...
+                 B.label, scol, side, sum(sel), n_valid, 100*frac_sel, 100*PRED_Q, ...
+                 100*frac_tie, median(thr), scol);
+        end
+
         rows = rows(sel, :);
         v = v(sel);
         split_median = median(v);
@@ -556,46 +578,15 @@ disp(summary);
 %  Four panels each, the same four as the notebook: butterfly of all channels, the left-M1
 %  ROI with its 95% CI across trials, the global mean field amplitude, and the scalp
 %  topography over the N45 window. The interpolated stretch is shaded grey -- nothing
-%  inside it is real data.
+%  inside it is real data. plot_tep_panels() at the bottom of this file draws it; section
+%  6b reuses it for the session grand average so the two cannot drift apart.
+
+pcfg = struct('subject', subject, 'session', session, 'ROI', {ROI}, 'ROI_NAME', ROI_NAME, ...
+    'PLOT_XLIM', PLOT_XLIM, 'TOPO_WIN', TOPO_WIN, 'ARTIFACT_TIMESPAN', ARTIFACT_TIMESPAN, ...
+    'RUN_TAG', RUN_TAG, 'fig_dir', fig_dir, 'fname', '', 'bg', [], 'bg_label', '');
 
 for iR = 1:numel(results)
-    r = results(iR);
-    t = r.times;
-    s = t >= PLOT_XLIM(1) & t <= PLOT_XLIM(2);
-    ci = 1.96 * r.sem;
-
-    hf = figure('Position', [50 50 1200 750], 'Color', 'w');
-
-    ax1 = subplot(2, 2, 1);
-    plot(t(s), r.evoked(:, s)', 'LineWidth', 0.5);
-    title(sprintf('Butterfly, %d channels', size(r.evoked, 1)));
-    xlabel('Time (ms)'); ylabel('Amplitude (uV)');
-
-    ax2 = subplot(2, 2, 2);
-    fill([t(s), fliplr(t(s))], [r.roi(s) - ci(s), fliplr(r.roi(s) + ci(s))], ...
-        [0 0.45 0.74], 'FaceAlpha', 0.25, 'EdgeColor', 'none'); hold on
-    plot(t(s), r.roi(s), 'LineWidth', 2, 'Color', [0 0.45 0.74]);
-    title(sprintf('ROI %s (%s), mean +/- 95%% CI', ROI_NAME, strjoin(ROI, ' ')));
-    xlabel('Time (ms)'); ylabel('Amplitude (uV)');
-
-    ax3 = subplot(2, 2, 3);
-    plot(t(s), r.gmfa(s), 'k', 'LineWidth', 1.5);
-    title('Global mean field amplitude');
-    xlabel('Time (ms)'); ylabel('GMFA (uV)');
-
-    for ax = [ax1 ax2 ax3]
-        mark_artifact_window(ax, ARTIFACT_TIMESPAN * 1000);
-    end
-
-    subplot(2, 2, 4);
-    w = t >= TOPO_WIN(1) & t <= TOPO_WIN(2);
-    topoplot(mean(r.evoked(:, w), 2), r.chanlocs, 'electrodes', 'on');
-    title(sprintf('Topography %d-%d ms', TOPO_WIN(1), TOPO_WIN(2)));
-
-    sgtitle(sprintf('sub-%s ses-%s  |  %s  |  %d trials  |  AARATEP%s', ...
-        subject, session, strrep(r.label, '_', '\_'), r.n, RUN_TAG));
-    print(hf, fullfile(fig_dir, sprintf('sub-%s_ses-%s_block-%s_desc-tep.png', ...
-        subject, session, r.label)), '-dpng', '-r150');
+    plot_tep_panels(results(iR), pcfg);
 end
 
 
@@ -662,6 +653,104 @@ sgtitle(sprintf('sub-%s: %s ROI averaged across intervention blocks (AARATEP)%s'
     subject, ROI_NAME, RUN_TAG));
 print(hf, fullfile(fig_dir, sprintf('sub-%s_ses-%s_desc-TEPaaratep_interventionGrandAverage.png', ...
     subject, session)), '-dpng', '-r150');
+
+
+%% 6b. The final figure: every trial in the session, averaged together
+%  One average over every cleaned single-pulse epoch the session produced -- baseline,
+%  calibration, both intervention conditions and every evaluation timepoint, pooled.
+%
+%  Built from the cleaned recordings rather than from `results`, and that distinction is
+%  the whole point: the block list deliberately overlaps (intervention_all_prime is the
+%  same trials as int1..4_prime, and the quartile splits are subsets of those again), so
+%  averaging the entries of `results` would count some trials three times over. Taking the
+%  epochs straight out of `cleaned` counts each exactly once.
+%
+%  Read it as a description of the session's TEP morphology and SNR, not as a result: it
+%  averages across the intervention itself, so any effect of PRIME on the N45 is averaged
+%  away by construction. The per-recording ROI means are drawn behind it in grey, which is
+%  where a recording that came out unlike the rest becomes visible.
+
+tasks_done = keys(cleaned);
+Cref   = cleaned(tasks_done{1});          % via a temp: chained indexing into a
+ref_ch = {Cref.EEG.chanlocs.labels};      % containers.Map return value is not reliable
+ref_t  = Cref.EEG.times(:)';
+ref_chanlocs = Cref.EEG.chanlocs;
+roiPickAll = find(ismember(ref_ch, ROI));
+assert(numel(ref_chanlocs) == numel(ref_ch), ...
+    'Reference chanlocs came back as %d entries for %d labels.', ...
+    numel(ref_chanlocs), numel(ref_ch));
+
+sumX   = zeros(numel(ref_ch), numel(ref_t));
+roiAll = [];
+bgAll  = [];
+nAll   = 0;
+comp   = {};
+for iT = 1:numel(tasks_done)
+    C = cleaned(tasks_done{iT});
+    [tf, loc] = ismember(ref_ch, {C.EEG.chanlocs.labels});
+    assert(all(tf), 'task-%s is missing channel(s) that task-%s has.', ...
+        tasks_done{iT}, tasks_done{1});
+    assert(numel(C.EEG.times) == numel(ref_t) && ...
+        max(abs(C.EEG.times(:)' - ref_t)) < 1e-6, ...
+        'task-%s has a different time axis from task-%s.', tasks_done{iT}, tasks_done{1});
+
+    X = double(C.EEG.data(loc, :, :));                  % reordered to the reference order
+    sumX = sumX + sum(X, 3);
+    roiThis = permute(mean(X(roiPickAll, :, :), 1), [3 2 1]);   % trials x time
+    roiAll  = [roiAll; roiThis];                                            %#ok<AGROW>
+    bgAll   = [bgAll;  mean(roiThis, 1)];                                   %#ok<AGROW>
+    nAll    = nAll + size(X, 3);
+    comp{end+1} = sprintf('%s:%d', tasks_done{iT}, size(X, 3));             %#ok<AGROW>
+end
+
+% How many of those epochs no block definition claims -- a trial whose condition fell
+% outside prime_single_pulse / predetermined_single, for instance. Printed rather than
+% silently folded in, since it is the one way this figure can cover trials the rest of the
+% script never looks at.
+claimed = 0;
+for iT = 1:numel(tasks_done)
+    T = events(tasks_done{iT});
+    inAny = false(height(T), 1);
+    for iB = 1:numel(blocks)
+        if ~strcmp(blocks(iB).task, tasks_done{iT}) || ~isempty(blocks(iB).split), continue; end
+        m = ismember(T.block_label, string(blocks(iB).blabels));
+        if ~isempty(blocks(iB).cond), m = m & strcmp(T.condition, blocks(iB).cond); end
+        inAny = inAny | m;
+    end
+    claimed = claimed + sum(ismember(T.row_in_task(inAny), cleaned(tasks_done{iT}).epochRows));
+end
+
+fprintf('\nGrand average over every trial: %d epochs from %d recordings [%s]\n', ...
+    nAll, numel(tasks_done), strjoin(comp, ', '));
+if claimed < nAll
+    fprintf(['  note: %d of them belong to no block definition (condition outside ' ...
+             'prime_single_pulse / predetermined_single) and appear only in this figure\n'], ...
+             nAll - claimed);
+end
+
+% Fields assigned in the same order as in section 4, because results(end+1) = ... needs
+% an exact field-name-and-order match against the existing struct array.
+grand_all = struct();
+grand_all.label        = 'grand_all';
+grand_all.task         = 'all';
+grand_all.times        = ref_t;
+grand_all.evoked       = sumX / nAll;
+grand_all.roi          = mean(roiAll, 1);
+grand_all.sem          = std(roiAll, 0, 1) / sqrt(nAll);
+grand_all.gmfa         = std(grand_all.evoked, 0, 1);
+grand_all.n            = nAll;
+grand_all.split_median = NaN;
+grand_all.chanlocs     = ref_chanlocs;
+assert(isequal(fieldnames(grand_all), fieldnames(results)), ...
+    'grand_all fields do not line up with results.');
+
+gcfg = pcfg;
+gcfg.fname    = sprintf('sub-%s_ses-%s_desc-TEPaaratep_grandAverageAll.png', subject, session);
+gcfg.bg       = bgAll;
+gcfg.bg_label = sprintf('%d recordings', numel(tasks_done));
+plot_tep_panels(grand_all, gcfg);
+
+results(end+1) = grand_all;      % so it lands in the waveforms CSV and the -ave.mat too
 
 
 %% 7. Save the waveforms
@@ -911,6 +1000,108 @@ function compare_quartiles(results, hiLab, loLab, ttl, fname, subject, session, 
     fprintf('\n');
 end
 
+
+
+function plot_tep_panels(r, p)
+% The four-panel TEP figure: butterfly, ROI mean with its 95% CI, GMFA, and the N45
+% topography. Used for every block in section 5 and for the session grand average in 6b.
+%
+% p.fname overrides the default filename; p.bg, if given, is a matrix of extra ROI traces
+% (one per row) drawn in grey behind the mean.
+    t  = r.times;
+    s  = t >= p.PLOT_XLIM(1) & t <= p.PLOT_XLIM(2);
+    ci = 1.96 * r.sem;
+    blue = [0 0.45 0.74];
+
+    hf = figure('Position', [50 50 1200 750], 'Color', 'w');
+
+    ax1 = subplot(2, 2, 1);
+    plot(t(s), r.evoked(:, s)', 'LineWidth', 0.5);
+    title(sprintf('Butterfly, %d channels', size(r.evoked, 1)));
+    xlabel('Time (ms)'); ylabel('Amplitude (uV)');
+
+    ax2 = subplot(2, 2, 2); hold(ax2, 'on');
+    if ~isempty(p.bg)
+        plot(ax2, t(s), p.bg(:, s)', 'Color', [0.75 0.75 0.75], 'LineWidth', 0.7);
+    end
+    fill(ax2, [t(s), fliplr(t(s))], [r.roi(s) - ci(s), fliplr(r.roi(s) + ci(s))], ...
+        blue, 'FaceAlpha', 0.25, 'EdgeColor', 'none');
+    plot(ax2, t(s), r.roi(s), 'LineWidth', 2, 'Color', blue);
+    ttl = sprintf('ROI %s (%s), mean +/- 95%% CI', p.ROI_NAME, strjoin(p.ROI, ' '));
+    if ~isempty(p.bg_label)
+        ttl = sprintf('%s\ngrey: %s', ttl, p.bg_label);
+    end
+    title(ax2, ttl);
+    xlabel(ax2, 'Time (ms)'); ylabel(ax2, 'Amplitude (uV)');
+
+    ax3 = subplot(2, 2, 3);
+    plot(t(s), r.gmfa(s), 'k', 'LineWidth', 1.5);
+    title('Global mean field amplitude');
+    xlabel('Time (ms)'); ylabel('GMFA (uV)');
+
+    for ax = [ax1 ax2 ax3]
+        mark_artifact_window(ax, p.ARTIFACT_TIMESPAN * 1000);
+    end
+
+    subplot(2, 2, 4);
+    w = t >= p.TOPO_WIN(1) & t <= p.TOPO_WIN(2);
+    plot_topo_safely(mean(r.evoked(:, w), 2), r.chanlocs, r.label);
+    title(sprintf('Topography %d-%d ms', p.TOPO_WIN(1), p.TOPO_WIN(2)));
+
+    sgtitle(sprintf('sub-%s ses-%s  |  %s  |  %d trials  |  AARATEP%s', ...
+        p.subject, p.session, strrep(r.label, '_', '\_'), r.n, p.RUN_TAG));
+
+    if isempty(p.fname)
+        fname = sprintf('sub-%s_ses-%s_block-%s_desc-tep.png', p.subject, p.session, r.label);
+    else
+        fname = p.fname;
+    end
+    print(hf, fullfile(p.fig_dir, fname), '-dpng', '-r150');
+end
+
+
+function plot_topo_safely(vals, chanlocs, label)
+% topoplot() needs exactly one value per channel THAT HAS COORDINATES. It builds its Th and
+% Rd from readlocs(), which returns only the located channels, and when that count does not
+% match numel(Values) it quietly skips assigning intValues -- so the failure surfaces 200
+% lines later as "Unrecognized function or variable 'intValues'", which says nothing about
+% the real problem. Check the precondition here and report it properly, and never let a
+% topography panel take down a run that has already spent an hour cleaning data.
+    vals = vals(:);
+    hasField = isfield(chanlocs, 'theta') && isfield(chanlocs, 'radius');
+    if hasField
+        noLoc = arrayfun(@(c) isempty(c.theta) || isempty(c.radius) || ...
+            ~isscalar(c.theta) || ~isscalar(c.radius) || ...
+            ~isfinite(c.theta) || ~isfinite(c.radius), chanlocs);
+    else
+        noLoc = true(1, numel(chanlocs));
+    end
+
+    problem = '';
+    if numel(vals) ~= numel(chanlocs)
+        problem = sprintf('%d values for %d channels', numel(vals), numel(chanlocs));
+    elseif any(noLoc)
+        problem = sprintf('%d channel(s) without coordinates: %s', sum(noLoc), ...
+            strjoin({chanlocs(noLoc).labels}, ', '));
+    elseif ~all(isfinite(vals))
+        problem = sprintf('%d non-finite value(s): %s', sum(~isfinite(vals)), ...
+            strjoin({chanlocs(~isfinite(vals)).labels}, ', '));
+    end
+
+    if isempty(problem)
+        try
+            topoplot(vals, chanlocs, 'electrodes', 'on');
+            return
+        catch err
+            problem = err.message;
+        end
+    end
+
+    warning('Topography skipped for %s: %s', label, problem);
+    axis off
+    text(0.5, 0.5, sprintf('topography unavailable\n%s', problem), ...
+        'HorizontalAlignment', 'center', 'Interpreter', 'none', 'FontSize', 9);
+end
 
 function out = ternary(cond, a, b)
     if cond, out = a; else, out = b; end
