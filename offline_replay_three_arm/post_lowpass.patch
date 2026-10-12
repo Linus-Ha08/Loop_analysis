@@ -1,0 +1,221 @@
+diff --git a/2_intervention.py b/2_intervention.py
+index 39c19e7..94387a1 100644
+--- a/2_intervention.py
++++ b/2_intervention.py
+@@ -810,6 +810,9 @@ class Decider:
+             "dipole": {"tmin": self.dipole_tmin, "tmax": self.dipole_tmax,
+                        "sfreq": self.preprocessor.post_sfreq},
+             "ica_sfreq": self.preprocessor.ica_sfreq,
++            # Frozen post-stimulus low-pass: settings only (the taps are in calibration_bundle.npy); None = off.
++            "post_lowpass": (self.preprocessor.post_lowpass.summary()
++                             if self.preprocessor.post_lowpass is not None else None),
+             "proc_shape": ("n_channels", "n_times"),
+             "units": "as received from the acquisition stream (microvolt-scale, uncalibrated)",
+         }, allow_pickle=True)
+@@ -828,6 +831,8 @@ class Decider:
+ 
+         print(f"Calibration took {time.perf_counter() - t0:.2f} seconds")
+         print(f"Calibration used {num_calibration_trials} trials")
++        print(self.preprocessor.post_lowpass.describe() if self.preprocessor.post_lowpass is not None
++              else "post low-pass: off")
+         bad_channels = self.preprocessor.calibration_params['bad_channels']
+         print(f"Calibration detected {len(bad_channels)} bad channels: {', '.join(bad_channels) if bad_channels else 'none'}")
+         self.write_calibration_summary(num_calibration_trials)
+diff --git a/prime_core/configs/prime.yaml b/prime_core/configs/prime.yaml
+index dea6048..c08ca4e 100644
+--- a/prime_core/configs/prime.yaml
++++ b/prime_core/configs/prime.yaml
+@@ -45,6 +45,13 @@ processed_sfreq: 1000  # QC + model window (PRIME input). Needs retraining to ch
+ ica_sfreq: 1000        # calibration ICA window (fit + ICLabel)
+ post_sfreq: 5000       # post-stimulus window, calibration and every pulse
+ 
++# --- Post-stimulus low-pass (zero-phase FIR, applied right after the first artifact blank) ---
++# Designed once in Preprocessor.calibrate() from these two numbers and post_sfreq, then frozen in
++# the calibration bundle: replay and every live pulse use the bundle, never this file.
++# Not applied (RuntimeWarning) if post_lowpass_hz >= post_sfreq / 2, e.g. at post_sfreq 1000.
++post_lowpass_hz: 500           # null / 0 = off
++post_lowpass_halfwidth_ms: 5   # reach on each side; 5 ms = 51 taps at 5 kHz
++
+ # --- Dipole sub-window search (seconds; converted with post_sfreq) ---
+ dipole_min_window: 0.003   # was min_window_size=3 samples at 1 kHz
+ dipole_max_window: 0.006   # was max_window_size=6 samples at 1 kHz
+diff --git a/prime_core/preprocessing/preprocessor.py b/prime_core/preprocessing/preprocessor.py
+index d0f7ec1..ea937a5 100644
+--- a/prime_core/preprocessing/preprocessor.py
++++ b/prime_core/preprocessing/preprocessor.py
+@@ -33,6 +33,7 @@ from prime_core.prime_config import (
+     get_processed_sfreq,
+     get_ica_sfreq,
+     get_post_sfreq,
++    get_post_lowpass,
+     get_post_initial_time_range,
+     get_post_time_range,
+     get_raw_sfreq,
+@@ -55,6 +56,7 @@ from prime_core.preprocessing.utils.mad import (
+     local_mad_zscore_rejected,
+ )
+ from prime_core.preprocessing.utils.resampling import resample_buffer_polyphase
++from prime_core.preprocessing.utils.post_lowpass import PostLowpass, STAMP_KEY as POST_LOWPASS_KEY
+ from prime_core.preprocessing.config import get_default_config
+ 
+ DATA_ROOT = Path(__file__).resolve().parent.parent.parent / "offline_data"
+@@ -426,11 +428,14 @@ def crop_mne_trial_to_buffer(
+ # ==================== Calibration pipeline ====================
+ 
+ 
+-def preprocess_calibration(qc_epochs, ica_epochs, post_epochs, cfg, opts, forward):
++def preprocess_calibration(qc_epochs, ica_epochs, post_epochs, cfg, opts, forward, post_lowpass=None):
+     """Full calibration preprocessing pipeline for qc, ica, and post epochs.
+ 
+     Returns ``(calibration_params, n_successful_trials, model_buffers, dipole_buffers)``
+     where the last two arrays are cropped to the model and dipole time windows.
++
++    ``post_lowpass`` is the calibrated :class:`PostLowpass` (or None = no filtering, i.e. the
++    behaviour before the low-pass existed); ``Preprocessor.calibrate`` designs and stamps it.
+     """
+     channel_reject_opts = opts['channel_reject_opts']
+     ica_opts = opts['ica_opts']
+@@ -449,6 +454,10 @@ def preprocess_calibration(qc_epochs, ica_epochs, post_epochs, cfg, opts, forwar
+         tmax=cfg.artifact_window_1[1],
+         mode='window',
+     )
++    if post_lowpass is not None:
++        # AFTER the blank, so only the small blank edge is smeared, never the TMS pulse.
++        # Same frozen filter as Preprocessor.preprocess_post.
++        post_lowpass.apply_to_epochs(post_epochs)
+ 
+     bad_channels_qc, qc_filter = _detect_bad_channels_qc(
+         qc_epochs, channel_reject_opts['pre'], filter_opts,
+@@ -618,9 +627,12 @@ def preprocess_calibration(qc_epochs, ica_epochs, post_epochs, cfg, opts, forwar
+ class Preprocessor:
+     """Accumulates raw trials and produces calibration parameters on demand."""
+ 
+-    def __init__(self, forward_path, *, ica_sfreq=None, post_sfreq=None):
++    def __init__(self, forward_path, *, ica_sfreq=None, post_sfreq=None, post_lowpass=None):
+         """``ica_sfreq`` / ``post_sfreq`` default to configs/prime.yaml; pass 1000.0 to
+-        reproduce the pre-5-kHz pipeline (e.g. to replay a legacy session)."""
++        reproduce the pre-5-kHz pipeline (e.g. to replay a legacy session).
++
++        ``post_lowpass`` are the settings calibrate() designs the post-stimulus low-pass from:
++        None = configs/prime.yaml, False = off, or ``(cutoff_hz, halfwidth_ms)``."""
+         cfg = get_default_config()
+         raw_sfreq = get_raw_sfreq()
+         self._forward = mne.read_forward_solution(str(forward_path), verbose=False)
+@@ -654,6 +666,15 @@ class Preprocessor:
+         self._info_ica = _info_with_sfreq(self._info, self._ica_sfreq)
+         self._info_post = _info_with_sfreq(self._info, self._post_sfreq)
+ 
++        # Post-stimulus low-pass: only the settings live here. The frozen filter is set by
++        # calibrate() / from_bundle() and stays None until then (and for bundles without a stamp).
++        if post_lowpass is None:
++            post_lowpass = get_post_lowpass()           # (cutoff_hz or None, halfwidth_ms)
++        elif post_lowpass is False:
++            post_lowpass = (None, 5.0)                  # explicitly off
++        self._post_lowpass_settings = (post_lowpass[0], float(post_lowpass[1]))
++        self._post_lowpass = None
++
+         self.qc_epochs = None
+         self.ica_epochs = None
+         self.post_epochs = None
+@@ -738,6 +759,9 @@ class Preprocessor:
+         if self.qc_epochs is None:
+             raise RuntimeError("No trials have been added yet.")
+ 
++        # Calibrate the post-stimulus low-pass: designed once here, applied to all calibration
++        # epochs and then frozen in the bundle (None = off, or cutoff >= Nyquist e.g. at 1 kHz).
++        post_lowpass = PostLowpass.design(*self._post_lowpass_settings, self._post_sfreq)
+         calibration_params, n_successful_trials, model_buffers, dipole_buffers = (
+             preprocess_calibration(
+                 self.qc_epochs.copy(),
+@@ -746,6 +770,7 @@ class Preprocessor:
+                 self._cfg,
+                 self._opts,
+                 self._forward,
++                post_lowpass=post_lowpass,
+             )
+         )
+         # Record the rates in the bundle: the SSP-SIR kernel and the blink-check
+@@ -753,8 +778,12 @@ class Preprocessor:
+         calibration_params['sfreq_qc'] = self._processed_sfreq
+         calibration_params['sfreq_ica'] = self._ica_sfreq
+         calibration_params['sfreq_post'] = self._post_sfreq
++        if post_lowpass is not None:
++            calibration_params[POST_LOWPASS_KEY] = post_lowpass.to_stamp()
+         self._calibration_params = calibration_params
+         self._check_bundle_matches_rates(calibration_params)
++        # The live filter is rebuilt from the stamp, exactly as from_bundle() does on replay.
++        self._post_lowpass = PostLowpass.from_bundle(calibration_params)
+         qc_shape = self.qc_epochs.get_data(copy=False).shape
+         self._mad_workspace = SingleTrialMadWorkspace(qc_shape[1], qc_shape[2])
+ 
+@@ -803,6 +832,8 @@ class Preprocessor:
+             idx = np.asarray(info['time_indices_of_interest'])
+             if idx.size and idx.max() >= n_post_initial:
+                 raise ValueError(f"ocular indices of IC {comp} exceed the {n_post_initial}-sample post epoch")
++        # Low-pass stamp (absent in legacy bundles -> nothing to check): same rate, fits the epoch.
++        PostLowpass.check_bundle(calibration_params, post_sfreq=self._post_sfreq, n_times=n_post_initial)
+ 
+     @classmethod
+     def from_bundle(cls, calibration_params, forward_path):
+@@ -810,15 +841,18 @@ class Preprocessor:
+ 
+         The post / ICA rates are taken from the bundle, not from the config, so legacy 1 kHz
+         bundles (pilot001-005) keep replaying exactly while new sessions run at 5 kHz.
++        The post-stimulus low-pass is restored from the bundle's stamp, never from the config;
++        a bundle without the stamp replays without it.
+         """
+         post_sfreq = cls.bundle_post_sfreq(calibration_params)
+         ica_sfreq = float(calibration_params.get('sfreq_ica', post_sfreq))
+-        instance = cls(forward_path, ica_sfreq=ica_sfreq, post_sfreq=post_sfreq)
++        instance = cls(forward_path, ica_sfreq=ica_sfreq, post_sfreq=post_sfreq, post_lowpass=False)
+         qc_sfreq = float(calibration_params.get('sfreq_qc', instance._processed_sfreq))
+         if abs(qc_sfreq - instance._processed_sfreq) > 1e-6:
+             raise ValueError(f"bundle QC rate {qc_sfreq} != processed_sfreq {instance._processed_sfreq}")
+         instance._check_bundle_matches_rates(calibration_params)
+         instance._calibration_params = calibration_params
++        instance._post_lowpass = PostLowpass.from_bundle(calibration_params)   # None for legacy bundles
+         n_channels = len(instance._info["ch_names"])
+         n_times = epoch_n_times(instance._qc_tmin, instance._qc_tmax, instance._processed_sfreq)
+         instance._mad_workspace = SingleTrialMadWorkspace(n_channels, n_times)
+@@ -832,6 +866,11 @@ class Preprocessor:
+     def ica_sfreq(self) -> float:
+         return self._ica_sfreq
+ 
++    @property
++    def post_lowpass(self):
++        """The frozen post-stimulus :class:`PostLowpass`, or None (off / legacy bundle / not yet calibrated)."""
++        return self._post_lowpass
++
+     def preprocess_pre(
+         self,
+         eeg_buffer: np.ndarray,
+@@ -988,6 +1027,8 @@ class Preprocessor:
+             tmax=self._cfg.artifact_window_1[1],
+             mode="window",
+         )
++        if self._post_lowpass is not None:
++            self._post_lowpass.apply_to_epochs(epoch_post)      # frozen at calibration; see calibrate()
+ 
+         if calibration_params["bad_channels"]:
+             epoch_post, _ = _interpolate_bad_channels(
+diff --git a/prime_core/prime_config.py b/prime_core/prime_config.py
+index d6ea486..6e0ef66 100644
+--- a/prime_core/prime_config.py
++++ b/prime_core/prime_config.py
+@@ -79,6 +79,16 @@ def get_post_sfreq() -> float:
+     return float(cfg.get("post_sfreq", cfg.processed_sfreq))
+ 
+ 
++def get_post_lowpass() -> tuple[float | None, float]:
++    """(cutoff in Hz or None = off, half-width in ms) of the post-stimulus low-pass.
++
++    Missing keys mean "off", so an older prime.yaml behaves exactly as before.
++    """
++    cfg = load_prime_config()
++    hz = cfg.get("post_lowpass_hz", None)
++    return (float(hz) if hz else None), float(cfg.get("post_lowpass_halfwidth_ms", 5.0))
++
++
+ def get_dipole_window_limits() -> tuple[float, float]:
+     """Min / max dipole sub-window length in seconds (defaults = 3 / 6 samples at 1 kHz)."""
+     cfg = load_prime_config()
