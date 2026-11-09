@@ -9,14 +9,26 @@ The online post chain (``Preprocessor.preprocess_post``) is replayed here from t
 saved raw buffers with the session's own ``calibration_bundle.npy``, stopping at four
 points so every step can be measured separately:
 
-    pre_sound : baseline -> artifact window -> interpolation -> avg ref -> ICA
-                -> baseline -> avg ref -> crop to [1, 100] ms      (SOUND's input)
+    pre_sound : baseline -> artifact window -> [500 Hz low-pass] -> interpolation
+                -> avg ref -> ICA -> baseline -> avg ref -> crop to [1, 100] ms
+                                                                    (SOUND's input)
     sound     : + SOUND spatial filter, + avg ref
     sspsir    : + SSP-SIR
     final     : + artifact window [1, 15] ms, + avg ref            (== *_post_proc.npy)
 
 Nothing in prime/ is imported for its side effects and nothing there is written to;
 the decider package is only put on sys.path (with bytecode writing disabled).
+
+Sampling rate: the post-stimulus chain runs at the rate the session's calibration bundle
+was made at (Preprocessor.from_bundle) -- 1 kHz for pilot001-005, 5 kHz since pilot006,
+whose bundles also switch on the 500 Hz post low-pass after the first artifact blank.
+All windows are given in ms and converted to samples at that rate.
+
+Trial groups: intervention trials are split by condition into ``intervention_single``
+(predetermined + PRIME single pulses) and ``intervention_triplet``. A triplet's third pulse
+lands at +20 ms, after the artifact blank, so triplets are kept out of every pooled page
+(evoked GFP, SNR, dimensionality, RMS / amplitude distributions) and only shown as their
+own group on the per-group page and in the CSVs.
 
 Measured per trial and stage
     RMS in the early / mid / N45 / late windows, GFP time course,
@@ -59,9 +71,12 @@ import pandas as pd
 
 BIDS_ROOT = Path("D:/Linus/Loop/BIDS")
 DECIDER = Path("D:/Linus/Loop/prime/decider")
-OUT_DIR = Path("D:/Linus/Loop/scripts_analysis/sound_sspsir_outputs")
-SUBJECTS = ["pilot003", "pilot004", "pilot005"]
-GROUPS = ["baseline", "calibration", "intervention", "evaluation"]
+OUT_DIR = Path("D:/Linus/Loop/scripts_analysis/sound_sspsir_pilot006")
+SUBJECTS = ["pilot006"]
+GROUPS = ["baseline", "calibration", "intervention", "evaluation"]  # --groups choices
+# Groups as they appear in the outputs: intervention split by condition (see docstring).
+TRIPLET = "intervention_triplet"
+GROUP_ORDER = ["baseline", "calibration", "intervention_single", TRIPLET, "evaluation"]
 
 STAGES = ["pre_sound", "sound", "sspsir", "final"]
 STAGE_LABEL = {
@@ -84,8 +99,10 @@ STAGE_LS = {"pre_sound": "-", "sound": "-", "sspsir": "-", "final": "--"}
 INK, MUTED, GRID = "#1a1a1a", "#5b5b5b", "#d8d8d8"
 
 # Windows in ms inside the [1, 100] ms post window (N45 is replaced per session by the
-# session's own dipole window from proc_info.npy).
-WINDOWS_MS = {"early": (1, 15), "mid": (15, 38), "n45": (38, 50), "late": (60, 100)}
+# session's own dipole window from proc_info.npy). "early" starts after the artifact blank
+# (artifact_window_1 ends at 14 ms, the final re-blank at 15 ms): 1-15 ms would only measure
+# the edge of the blank, not muscle.
+WINDOWS_MS = {"early": (15, 25), "mid": (25, 38), "n45": (38, 50), "late": (60, 100)}
 
 
 # --------------------------------------------------------------------------------------
@@ -114,8 +131,14 @@ def load_session_files(run_dir: Path) -> dict:
     return out
 
 
-def list_trials(run_dir: Path, groups, limit=None) -> list[tuple[str, str, Path]]:
-    """(group, stem, post_raw path) for the requested trial groups."""
+def list_trials(run_dir: Path, groups, limit=None, conditions=None) -> list[tuple[str, str, Path]]:
+    """(group, stem, post_raw path) for the requested trial groups.
+
+    Intervention trials are labelled intervention_single / intervention_triplet from
+    ``conditions`` (stem -> condition, from trials_intervention.csv); without it they stay
+    "intervention".
+    """
+    conditions = conditions or {}
     found = []
     for path in sorted(run_dir.glob("*_post_raw.npy")):
         stem = path.name[: -len("_post_raw.npy")]
@@ -124,6 +147,8 @@ def list_trials(run_dir: Path, groups, limit=None) -> list[tuple[str, str, Path]
             continue
         group = re.sub(r"_(block_)?\d+$", "", m.group(1))
         if group in groups:
+            if group == "intervention" and stem in conditions:
+                group = TRIPLET if conditions[stem] == "prime_triplet" else "intervention_single"
             found.append((group, stem, path))
     if limit:
         keep, seen = [], {}
@@ -153,28 +178,37 @@ def build_replayer(decider: Path, forward_path: Path, sess: dict):
         _numpy_to_epochs_array,
     )
     from prime_core.preprocessing.utils.resampling import resample_buffer_polyphase
+    from prime_core.preprocessing.utils.post_lowpass import lowpass_post
     from prime_core.preprocessing.utils.ssp_sir_python import ssp_sir_single_trial
     from prime_core.preprocessing.dipole_fitter import DipoleFitter
 
-    pp = Preprocessor(forward_path)
-    pp._calibration_params = sess["bundle"]
+    # from_bundle takes the post / ICA rates from the bundle itself (1 kHz for pilot001-005,
+    # 5 kHz since pilot006), not from prime.yaml, and checks the bundle against them.
+    pp = Preprocessor.from_bundle(sess["bundle"], forward_path)
     pp.keep_full_epochs = True
+    post_sfreq = pp.post_sfreq
 
-    fitter = DipoleFitter(forward_path)
+    # index_range in dipole_fitting_info is in samples at the fit's rate -> same rate here.
+    fitter = DipoleFitter(forward_path, sfreq=post_sfreq)
     fitter._fitting_info = sess["dipole"]
 
     cp, cfg = sess["bundle"], pp._cfg
-    raw_sfreq, proc_sfreq = pp._info["sfreq"], pp._processed_sfreq
+    raw_sfreq = pp._info["sfreq"]
+    post_lowpass = bool(cp.get("post_lowpass", False))  # absent in pre-pilot006 bundles
 
     def stages(raw_post: np.ndarray) -> dict[str, np.ndarray]:
-        """raw_post: (n_samples, n_channels) at 5 kHz over [post_initial_tmin, tmax]."""
-        buf = resample_buffer_polyphase(raw_post, sfreq_from=raw_sfreq, sfreq_to=proc_sfreq)
-        ep = _numpy_to_epochs_array(buf, pp._info_processed, pp._post_initial_tmin)
+        """raw_post: (n_samples, n_channels) at raw_sfreq over [post_initial_tmin, tmax]."""
+        # 5 kHz -> 5 kHz is a plain copy (no anti-alias filter); legacy bundles go to 1 kHz.
+        buf = resample_buffer_polyphase(raw_post, sfreq_from=raw_sfreq, sfreq_to=post_sfreq)
+        ep = _numpy_to_epochs_array(buf, pp._info_post, pp._post_initial_tmin)
 
         ep.apply_baseline(cfg.baseline, verbose=False)
         ep = mne.preprocessing.fix_stim_artifact(
             ep, tmin=cfg.artifact_window_1[0], tmax=cfg.artifact_window_1[1], mode="window"
         )
+        if post_lowpass:  # after the first blank, exactly as preprocess_post does
+            data = lowpass_post(ep.get_data(copy=True), post_sfreq)
+            ep = mne.EpochsArray(data, ep.info, events=ep.events, tmin=ep.times[0], verbose=False)
         if cp["bad_channels"]:
             ep, _ = _interpolate_bad_channels(ep, cp["bad_channels"], cp["channel_interpolation_info"])
         ep.set_eeg_reference("average", projection=False, verbose=False)
@@ -207,7 +241,7 @@ def build_replayer(decider: Path, forward_path: Path, sess: dict):
         out["final"] = ep.get_data(copy=True)[0]
         return out
 
-    return stages, fitter, proc_sfreq
+    return stages, fitter, post_sfreq, post_lowpass
 
 
 # --------------------------------------------------------------------------------------
@@ -318,22 +352,41 @@ def run_session(subject: str, args) -> tuple[pd.DataFrame, dict]:
     run_dir = find_session(Path(args.bids_root), subject)
     sess = load_session_files(run_dir)
     forward = Path(args.forward or Path(args.decider) / "offline_data/fsaverage/fsaverage-fwd.fif")
-    stages, fitter, sfreq = build_replayer(Path(args.decider), forward, sess)
+    stages, fitter, sfreq, post_lowpass = build_replayer(Path(args.decider), forward, sess)
 
-    dip_ms = sess["proc_info"]["dipole"]
+    pinfo = sess["proc_info"]
+    # proc_info has one rate per window since pilot006; older sessions one top-level 'sfreq'.
+    pinfo_sfreq = float(pinfo["post"].get("sfreq", pinfo.get("sfreq", np.nan)))
+    if abs(pinfo_sfreq - sfreq) > 1e-6:
+        raise ValueError(f"[{subject}] bundle post rate {sfreq} Hz != proc_info post rate {pinfo_sfreq} Hz")
+
+    dip_ms = pinfo["dipole"]
     win = dict(WINDOWS_MS, n45=(dip_ms["tmin"] * 1000, dip_ms["tmax"] * 1000))
-    post_t0 = sess["proc_info"]["post"]["tmin"] * 1000  # 1 ms
-    slices = {k: slice(int(round(a - post_t0)), int(round(b - post_t0)) + 1) for k, (a, b) in win.items()}
+    post_t0 = pinfo["post"]["tmin"] * 1000  # 1 ms
+    n_post = int(round((pinfo["post"]["tmax"] * 1000 - post_t0) * sfreq / 1000)) + 1
+    t_ms = post_t0 + np.arange(n_post) * 1000.0 / sfreq  # time axis of the [1, 100] ms epoch
 
-    reasons, online_amp = {}, {}
+    def _idx(ms: float) -> int:
+        return int(round((ms - post_t0) * sfreq / 1000))
+
+    slices = {k: slice(_idx(a), _idx(b) + 1) for k, (a, b) in win.items()}
+    n_dip = slices["n45"].stop - slices["n45"].start
+    if n_dip != fitter._post_n_times:
+        raise ValueError(f"[{subject}] dipole slice has {n_dip} samples, DipoleFitter expects {fitter._post_n_times}")
+
+    reasons, online_amp, conditions = {}, {}, {}
     if sess["trials"] is not None:
         for _, r in sess["trials"].iterrows():
             key = f"{r['stage']}_{int(r['trial_in_stage']):04d}"
             reasons[key] = r.get("post_reject_reason")
             online_amp[key] = r.get("tep_amplitude_raw")
+            conditions[key] = r.get("condition")
 
-    trials = list_trials(run_dir, args.groups, args.limit)
-    print(f"[{subject}] {run_dir}  ({len(trials)} trials)")
+    trials = list_trials(run_dir, args.groups, args.limit, conditions)
+    if any(g == "intervention" for g, _, _ in trials):
+        warnings.warn(f"[{subject}] no condition column for intervention trials -- triplets cannot be separated")
+    print(f"[{subject}] {run_dir}  ({len(trials)} trials, post at {sfreq:.0f} Hz, "
+          f"500 Hz low-pass {'on' if post_lowpass else 'off'})")
 
     rows, evoked_acc, cov_acc, repro = [], {}, {}, []
     for i, (group, stem, path) in enumerate(trials, 1):
@@ -357,6 +410,7 @@ def run_session(subject: str, args) -> tuple[pd.DataFrame, dict]:
                 "group": group,
                 "stem": stem,
                 "stage": stage,
+                "condition": conditions.get(stem, group),
                 "post_reject_reason": reasons.get(stem, np.nan),
             }
             row.update({f"rms_{k}": win_rms(x, s) for k, s in slices.items()})
@@ -377,9 +431,10 @@ def run_session(subject: str, args) -> tuple[pd.DataFrame, dict]:
             acc = evoked_acc.setdefault(key, [np.zeros_like(x), 0])
             acc[0] += x
             acc[1] += 1
-            cov_acc.setdefault(stage, np.zeros((x.shape[0], x.shape[0])))
-            seg = x[:, slices["n45"]]
-            cov_acc[stage] += seg @ seg.T
+            if group != TRIPLET:  # pooled dimensionality: single pulses only
+                cov_acc.setdefault(stage, np.zeros((x.shape[0], x.shape[0])))
+                seg = x[:, slices["n45"]]
+                cov_acc[stage] += seg @ seg.T
 
     df = pd.DataFrame(rows)
     evoked = {k: (v[0] / v[1], v[1]) for k, v in evoked_acc.items()}
@@ -387,12 +442,13 @@ def run_session(subject: str, args) -> tuple[pd.DataFrame, dict]:
     # Evoked / single-trial SNR per stage, from the accumulated averages.
     snr = {}
     for stage in STAGES:
-        ev = [evoked[(g, stage)] for g in args.groups if (g, stage) in evoked]
+        # single pulses only: a triplet's +20 ms pulse would dominate any pooled average
+        ev = [v for (g, s), v in evoked.items() if s == stage and g != TRIPLET]
         if not ev:
             continue
         n_tot = sum(n for _, n in ev)
         mean_ev = sum(e * n for e, n in ev) / n_tot
-        sub = df[df.stage == stage]
+        sub = df[(df.stage == stage) & (df.group != TRIPLET)]
         snr[stage] = {
             "evoked_rms_n45": win_rms(mean_ev, slices["n45"]),
             "trial_rms_n45": float(sub["rms_n45"].median()),
@@ -415,14 +471,17 @@ def run_session(subject: str, args) -> tuple[pd.DataFrame, dict]:
         amp_err=amp_err,
         amp_online_err=amp_online_err,
         dipole_window_ms=f"{win['n45'][0]:.0f}-{win['n45'][1]:.0f}",
-        fit_window_ms="{:.0f}-{:.0f}".format(
-            win["n45"][0] + sess["dipole"]["index_range"][0],
-            win["n45"][0] + sess["dipole"]["index_range"][1] - 1,
+        # index_range counts samples from the dipole window start, at the post rate
+        fit_window_ms="{:.1f}-{:.1f}".format(
+            win["n45"][0] + sess["dipole"]["index_range"][0] * 1000 / sfreq,
+            win["n45"][0] + (sess["dipole"]["index_range"][1] - 1) * 1000 / sfreq,
         ),
         slices=slices,
+        t_ms=t_ms,
         evoked=evoked,
         snr=snr,
         sfreq=sfreq,
+        post_lowpass=post_lowpass,
     )
     return df, info
 
@@ -463,23 +522,26 @@ def make_pdf(df: pd.DataFrame, infos: list[dict], out_pdf: Path, groups):
         return ax
 
     subs = [i["subject"] for i in infos]
+    df_all = df
+    df = df[df.group != TRIPLET]  # every pooled page below: single pulses only
     with PdfPages(out_pdf) as pdf:
         # ---- page 1: what was run, and the self-check ------------------------------
         fig = plt.figure()
         fig.suptitle("SOUND and SSP-SIR — online post-stimulus chain, replayed", y=0.97)
         lines = [
             "stages: pre_sound (SOUND input) -> sound -> sspsir -> final (== *_post_proc.npy)",
-            f"trial groups: {', '.join(groups)}",
+            f"trial groups: {', '.join(groups)}  (intervention split into single / triplet; "
+            f"triplets only on the last page -- their +20 ms pulse falls after the blank)",
             "",
             f"{'session':<10}{'trials':>7}{'replication':>13}{'amp check':>11}{'vs online':>11}"
-            f"{'crop win':>10}{'fit win':>9}{'SOUND dof':>11}{'|F-I|':>8}{'SSP PCs':>9}"
+            f"{'post Hz':>9}{'crop win':>10}{'fit win':>12}{'SOUND dof':>11}{'|F-I|':>8}{'SSP PCs':>9}"
             f"{'rank M':>8}{'kernel@fit':>12}  bad channels",
         ]
         for i in infos:
             lines.append(
                 f"{i['subject']:<10}{i['n_trials']:>7}{i['repro_max_abs']:>13.2e}"
                 f"{i['amp_err']:>11.2e}{i['amp_online_err']:>11.2e}"
-                f"{i['dipole_window_ms']:>10}{i['fit_window_ms']:>9}{i['sound_dof']:>11.1f}"
+                f"{i['sfreq']:>9.0f}{i['dipole_window_ms']:>10}{i['fit_window_ms']:>12}{i['sound_dof']:>11.1f}"
                 f"{i['sound_dev_identity']:>8.3f}{i['sspsir_n_pcs']:>9}{i['sspsir_rank_M']:>8}"
                 f"{np.mean(np.asarray(i['sspsir_kernel'])[i['slices']['n45']]):>12.3f}"
                 f"  {i['bad_channels']}"
@@ -490,6 +552,8 @@ def make_pdf(df: pd.DataFrame, infos: list[dict], out_pdf: Path, groups):
             "amp check   = max |own dipole fit − DipoleFitter.fit_trial|  (expect ~1e-15)",
             "vs online   = max |fit_trial − tep_amplitude_raw in the trial table|",
             "SOUND dof = trace of the filter, out of 60 channels; |F-I| = RMS distance from identity",
+            "post Hz = rate of the post-stimulus chain (from the calibration bundle); "
+            + "; ".join(f"{i['subject']} 500 Hz low-pass {'on' if i['post_lowpass'] else 'off'}" for i in infos),
         ]
         fig.text(0.06, 0.86, "\n".join(lines), family="monospace", va="top", fontsize=8.5)
         pdf.savefig(fig)
@@ -519,7 +583,7 @@ def make_pdf(df: pd.DataFrame, infos: list[dict], out_pdf: Path, groups):
         fig, axes = plt.subplots(1, 3)
         fig.suptitle("SSP-SIR — when it acts, how much it removes", y=0.96)
         for i in infos:
-            t = np.arange(len(i["sspsir_kernel"])) + 1
+            t = i["t_ms"]
             axes[0].plot(t, i["sspsir_kernel"], lw=2, label=i["subject"])
             axes[1].plot(t, i["sspsir_gain"], lw=2, label=i["subject"])
         for ax, ttl, yl in (
@@ -549,12 +613,12 @@ def make_pdf(df: pd.DataFrame, infos: list[dict], out_pdf: Path, groups):
         for c, i in enumerate(infos):
             curves = {}
             for stage in STAGES:
-                ev = [(e, n) for (g, s), (e, n) in i["evoked"].items() if s == stage]
+                ev = [(e, n) for (g, s), (e, n) in i["evoked"].items() if s == stage and g != TRIPLET]
                 if not ev:
                     continue
                 mean_ev = sum(e * n for e, n in ev) / sum(n for _, n in ev)
                 curves[stage] = gfp(mean_ev)
-            t = np.arange(len(next(iter(curves.values())))) + 1
+            t = i["t_ms"]
             for stage, y in curves.items():
                 for r in (0, 1):
                     axes[r, c].plot(t, y, lw=2, ls=STAGE_LS[stage], color=STAGE_COLOR[stage],
@@ -617,7 +681,7 @@ def make_pdf(df: pd.DataFrame, infos: list[dict], out_pdf: Path, groups):
             pr = [next((i["snr"][stage]["pr_n45"] for i in infos if i["subject"] == s), np.nan) for s in subs]
             axes[2].bar(x + off, pr, 0.19, color=STAGE_COLOR[stage])
         for ax, ttl, yl in (
-            (axes[0], ">100 Hz residual, 1-15 ms", "RMS (µV)"),
+            (axes[0], f">100 Hz residual, {WINDOWS_MS['early'][0]}-{WINDOWS_MS['early'][1]} ms", "RMS (µV)"),
             (axes[1], "evoked / single-trial RMS in dipole window", "SNR"),
             (axes[2], "effective dimensions, dipole window", "participation ratio"),
         ):
@@ -689,8 +753,8 @@ def make_pdf(df: pd.DataFrame, infos: list[dict], out_pdf: Path, groups):
         axes = np.atleast_1d(axes)
         fig.suptitle("Dipole-window RMS by trial group — does the calibrated filter keep working?", y=0.96)
         for ax, i in zip(axes, infos):
-            sub = df[df.subject == i["subject"]]
-            present = [g for g in groups if (sub.group == g).any()]
+            sub = df_all[df_all.subject == i["subject"]]
+            present = [g for g in GROUP_ORDER + ["intervention"] if (sub.group == g).any()]
             for stage in STAGES:
                 med = [sub[(sub.group == g) & (sub.stage == stage)]["rms_n45"].median() for g in present]
                 ax.plot(present, med, lw=2, ls=STAGE_LS[stage], marker=STAGE_MARKER[stage], ms=6,
@@ -742,7 +806,7 @@ def main() -> None:
             {
                 k: v
                 for k, v in i.items()
-                if k not in {"sound_sv", "sound_diag", "sspsir_kernel", "sspsir_gain", "evoked", "snr", "slices"}
+                if k not in {"sound_sv", "sound_diag", "sspsir_kernel", "sspsir_gain", "evoked", "snr", "slices", "t_ms"}
             }
             | {
                 "kernel_mean_dipole_window": float(
